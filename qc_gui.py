@@ -36,7 +36,7 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFilter
 
 from common import (
     apply_transform,
@@ -172,7 +172,7 @@ class QcGui(tk.Tk):
         self.root_dir, self.records, self.out_csv, self.mask_out_dir = resolved
         self.mask_out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.index = 0
+        self.index = self.first_unreviewed_index()
         self.cache: OrderedDict[int, tuple[np.ndarray, tuple[int, int]]] = OrderedDict()
         self.base_img: np.ndarray | None = None
         self.base_mask_img: Image.Image | None = None
@@ -210,6 +210,7 @@ class QcGui(tk.Tk):
         self.mode_var = tk.StringVar()
         self.mask_src_var = tk.StringVar()
         self.status_var = tk.StringVar()
+        self.reviewed_var = tk.StringVar()
 
         self.title("Autoradiograph QC GUI")
         self.geometry("1500x950")
@@ -281,11 +282,21 @@ class QcGui(tk.Tk):
         self.mode_button.pack(side="left")
         ttk.Button(toolbar, text="Clear mask", command=self.clear_mask).pack(side="left", padx=(2, 10))
 
+        ttk.Button(toolbar, text="Erode (E)", command=self.erode_mask).pack(side="left")
+        ttk.Button(toolbar, text="Dilate (D)", command=self.dilate_mask).pack(side="left", padx=(2, 10))
+
         ttk.Button(toolbar, text="Brush -", command=lambda: self.change_brush(-2)).pack(side="left")
         ttk.Label(toolbar, textvariable=self.brush_var, width=10).pack(side="left")
         ttk.Button(toolbar, text="Brush +", command=lambda: self.change_brush(2)).pack(side="left", padx=(0, 10))
 
         ttk.Button(toolbar, text="Save", command=self.save_now).pack(side="left")
+
+        self.reviewed_button = ttk.Button(toolbar, text="Mark reviewed", command=self.toggle_reviewed)
+        self.reviewed_button.pack(side="left", padx=(10, 4))
+        self.reviewed_label = tk.Label(
+            toolbar, textvariable=self.reviewed_var, font=("TkDefaultFont", 10, "bold")
+        )
+        self.reviewed_label.pack(side="left")
 
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right")
 
@@ -339,9 +350,9 @@ class QcGui(tk.Tk):
         ttk.Label(statusbar, textvariable=self.state_var).grid(row=0, column=3, sticky="e")
 
         help_text = (
-            "Left/Right: section    r/Rotate buttons: rotate 90    h: flip H    v: flip V    "
+            "Left/Right: section    r: rotate 90    h: flip H    v: flip V    "
             "Left-drag: draw    Right-drag: erase    e: toggle draw/erase    c: clear    "
-            "[ ]: brush size    s: save    Esc/q: quit"
+            "E: erode    D: dilate    [ ]: brush size    m: toggle reviewed    s: save    Esc/q: quit"
         )
         ttk.Label(self, text=help_text, padding=(8, 2)).grid(row=4, column=0, sticky="w")
         self.update_brush_label()
@@ -403,7 +414,6 @@ class QcGui(tk.Tk):
         self.last_pt = None
         self.mask_dirty = False
         self.disp_index = None
-        self.records.at[self.index, "qc_reviewed"] = True  # displaying a section marks it reviewed
         self.render_all()
         self.schedule_csv_save()
 
@@ -547,6 +557,7 @@ class QcGui(tk.Tk):
         self.last_pt = None
         if self.mask_dirty:
             self.records.at[self.index, "qc_reviewed"] = True
+            self.update_status()
             self.schedule_mask_save()
             self.schedule_csv_save()
 
@@ -561,6 +572,25 @@ class QcGui(tk.Tk):
         self.update_status()
         self.schedule_mask_save()
         self.schedule_csv_save()
+
+    def apply_morphology(self, grow: bool) -> None:
+        """Dilate (grow) or erode (shrink) the overlay mask by one pixel step."""
+        if self.base_mask_img is None:
+            return
+        kernel = ImageFilter.MaxFilter(3) if grow else ImageFilter.MinFilter(3)
+        self.base_mask_img = self.base_mask_img.filter(kernel)
+        self.mask_dirty = True
+        self.records.at[self.index, "qc_reviewed"] = True
+        self.render_overlay()
+        self.update_status()
+        self.schedule_mask_save()
+        self.schedule_csv_save()
+
+    def erode_mask(self) -> None:
+        self.apply_morphology(grow=False)
+
+    def dilate_mask(self) -> None:
+        self.apply_morphology(grow=True)
 
     # --- transforms --------------------------------------------------------- #
     def rotate(self, delta: int) -> None:
@@ -639,6 +669,10 @@ class QcGui(tk.Tk):
             self.move(-1)
         elif key in ("Right", "Down"):
             self.move(1)
+        elif key == "E":
+            self.erode_mask()
+        elif key == "D":
+            self.dilate_mask()
         elif char == "r":
             self.rotate(1)
         elif char == "h":
@@ -649,6 +683,8 @@ class QcGui(tk.Tk):
             self.clear_mask()
         elif char == "e":
             self.toggle_erase()
+        elif char == "m":
+            self.toggle_reviewed()
         elif char == "s":
             self.save_now()
         elif char == "[":
@@ -725,17 +761,43 @@ class QcGui(tk.Tk):
         self.commit_current()
         self.destroy()
 
+    # --- reviewed state ----------------------------------------------------- #
+    def first_unreviewed_index(self) -> int:
+        """Index of the first section not yet marked reviewed (0 if all are)."""
+        for i in range(len(self.records)):
+            if not truthy(self.records.at[i, "qc_reviewed"]):
+                return i
+        return 0
+
+    def toggle_reviewed(self) -> None:
+        reviewed = not truthy(self.records.at[self.index, "qc_reviewed"])
+        self.records.at[self.index, "qc_reviewed"] = reviewed
+        self.update_reviewed_indicator(reviewed)
+        self.schedule_csv_save()
+
+    def update_reviewed_indicator(self, reviewed: bool | None = None) -> None:
+        if reviewed is None:
+            reviewed = truthy(self.records.at[self.index, "qc_reviewed"])
+        if reviewed:
+            self.reviewed_var.set("\u25cf reviewed")
+            self.reviewed_label.configure(fg="#2ca02c")
+            self.reviewed_button.configure(text="Unmark reviewed")
+        else:
+            self.reviewed_var.set("\u25cb not reviewed")
+            self.reviewed_label.configure(fg="#c0392b")
+            self.reviewed_button.configure(text="Mark reviewed")
+
     # --- status ------------------------------------------------------------- #
     def update_status(self) -> None:
         row = self.records.iloc[self.index]
         flip_display = self.flip if self.flip else "none"
-        reviewed = "reviewed" if truthy(row["qc_reviewed"]) else "not reviewed"
         self.position_var.set(f"{self.index + 1} / {len(self.records)}")
         self.file_var.set(str(row["base"]))
-        self.mask_src_var.set(f"mask: {self.mask_source}  ({reviewed})")
+        self.mask_src_var.set(f"mask: {self.mask_source}")
         self.state_var.set(
             f"flip: {flip_display}    rotation: {self.rotation} x 90 ({self.rotation * 90:+d} deg)"
         )
+        self.update_reviewed_indicator(truthy(row["qc_reviewed"]))
 
 
 # --------------------------------------------------------------------------- #
