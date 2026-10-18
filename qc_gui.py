@@ -53,7 +53,7 @@ MASK_THRESHOLD = 0       # mask foreground = value > threshold
 OVERLAY_ALPHA = 110      # 0..255 opacity of the red overlay
 MAX_CACHE_ITEMS = 4
 SAVE_DEBOUNCE_MS = 400
-DEFAULT_BRUSH = 14       # brush radius in on-screen pixels
+DEFAULT_BRUSH = 64       # brush radius in on-screen pixels
 MIN_BRUSH = 2
 MAX_BRUSH = 120
 
@@ -207,6 +207,7 @@ class QcGui(tk.Tk):
         self.file_var = tk.StringVar()
         self.state_var = tk.StringVar()
         self.brush_var = tk.StringVar()
+        self.brush_entry_var = tk.StringVar()
         self.mode_var = tk.StringVar()
         self.mask_src_var = tk.StringVar()
         self.status_var = tk.StringVar()
@@ -287,7 +288,12 @@ class QcGui(tk.Tk):
 
         ttk.Button(toolbar, text="Brush -", command=lambda: self.change_brush(-2)).pack(side="left")
         ttk.Label(toolbar, textvariable=self.brush_var, width=10).pack(side="left")
-        ttk.Button(toolbar, text="Brush +", command=lambda: self.change_brush(2)).pack(side="left", padx=(0, 10))
+        ttk.Button(toolbar, text="Brush +", command=lambda: self.change_brush(2)).pack(side="left")
+        ttk.Label(toolbar, text="px:").pack(side="left", padx=(6, 2))
+        self.brush_entry = ttk.Entry(toolbar, textvariable=self.brush_entry_var, width=5)
+        self.brush_entry.pack(side="left", padx=(0, 10))
+        self.brush_entry.bind("<Return>", self.on_brush_entry)
+        self.brush_entry.bind("<FocusOut>", self.on_brush_entry)
 
         ttk.Button(toolbar, text="Save", command=self.save_now).pack(side="left")
 
@@ -624,6 +630,16 @@ class QcGui(tk.Tk):
 
     def update_brush_label(self) -> None:
         self.brush_var.set(f"brush: {self.brush}px")
+        self.brush_entry_var.set(str(self.brush))
+
+    def on_brush_entry(self, _event: tk.Event | None = None) -> None:
+        try:
+            value = int(float(self.brush_entry_var.get()))
+        except (TypeError, ValueError):
+            self.update_brush_label()  # restore the last valid value
+            return
+        self.brush = int(min(MAX_BRUSH, max(MIN_BRUSH, value)))
+        self.update_brush_label()
 
     def update_mode_label(self) -> None:
         mode = "Erase" if self.erase_mode else "Draw"
@@ -663,6 +679,8 @@ class QcGui(tk.Tk):
         self.save_mask()
 
     def on_key(self, event: tk.Event) -> None:
+        if isinstance(self.focus_get(), (tk.Entry, ttk.Entry)):
+            return  # let the brush-size entry handle its own keystrokes
         key = event.keysym
         char = event.char.lower() if event.char else ""
         if key in ("Left", "Up"):
