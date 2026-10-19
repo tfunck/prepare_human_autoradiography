@@ -47,6 +47,7 @@ from common import (
     rel_path,
     resolve_path,
 )
+from stack_view import StackView, make_thumb
 
 WORK_MAX = 1600          # longest side of the in-memory working image
 MASK_THRESHOLD = 0       # mask foreground = value > threshold
@@ -172,6 +173,11 @@ class QcGui(tk.Tk):
         self.root_dir, self.records, self.out_csv, self.mask_out_dir = resolved
         self.mask_out_dir.mkdir(parents=True, exist_ok=True)
 
+        self.master_df = self._load_master()
+        self.splits_dir = self.split_csv_path.parent if self.split_csv_path else self.root_dir / "csv" / "splits"
+        self.stack: StackView | None = None
+        self._stack_syncing = False
+
         self.index = self.first_unreviewed_index()
         self.cache: OrderedDict[int, tuple[np.ndarray, tuple[int, int]]] = OrderedDict()
         self.base_img: np.ndarray | None = None
@@ -224,6 +230,8 @@ class QcGui(tk.Tk):
 
         self.load_current()
         self.after(100, self.focus_force)
+        if self.master_df is not None:
+            self.after(400, self._auto_open_stack)
 
     def resolve_inputs(
         self,
@@ -250,6 +258,7 @@ class QcGui(tk.Tk):
             messagebox.showerror("Autoradiograph QC GUI", f"CSV not found:\n{csv_path}", parent=self)
             return None
         root_dir = find_root(csv_path, root_override)
+        self.split_csv_path = csv_path
         out_csv = Path(out_csv_override).expanduser().resolve() if out_csv_override else csv_path.with_suffix(".qc.csv")
         mask_out_dir = Path(mask_dir_override).expanduser().resolve() if mask_dir_override else root_dir / "mask_qc"
         try:
@@ -322,6 +331,11 @@ class QcGui(tk.Tk):
         ttk.Button(controls, text="Auto", command=self.auto_contrast).pack(side="left", padx=(4, 4))
         ttk.Button(controls, text="Reset", command=self.reset_contrast).pack(side="left")
 
+        self.stack_button = ttk.Button(controls, text="Stack", command=self.toggle_stack)
+        self.stack_button.pack(side="left", padx=(12, 0))
+        if self.master_df is None:
+            self.stack_button.state(["disabled"])
+
         self.reviewed_label = tk.Label(
             controls, textvariable=self.reviewed_var, font=("TkDefaultFont", 10, "bold")
         )
@@ -359,7 +373,7 @@ class QcGui(tk.Tk):
         help_text = (
             "Left/Right: section    r: rotate 90    h: flip H    v: flip V    "
             "Left-drag: draw    Right-drag: erase    e: toggle draw/erase    c: clear    "
-            "E: erode    D: dilate    [ ]: brush size    m: toggle reviewed    s: save    Esc/q: quit"
+            "E: erode    D: dilate    [ ]: brush size    m: toggle reviewed    k: stack    +/-: zoom stack    s: save    Esc/q: quit"
         )
         ttk.Label(self, text=help_text, padding=(8, 2)).grid(row=4, column=0, sticky="w")
         self.update_brush_label()
@@ -423,6 +437,7 @@ class QcGui(tk.Tk):
         self.disp_index = None
         self.render_all()
         self.schedule_csv_save()
+        self._sync_stack()
 
     # --- rendering ---------------------------------------------------------- #
     def render_all(self) -> None:
@@ -567,6 +582,7 @@ class QcGui(tk.Tk):
             self.update_status()
             self.schedule_mask_save()
             self.schedule_csv_save()
+            self._update_stack_slice()
 
     def clear_mask(self) -> None:
         if self.base_mask_img is None:
@@ -579,6 +595,7 @@ class QcGui(tk.Tk):
         self.update_status()
         self.schedule_mask_save()
         self.schedule_csv_save()
+        self._update_stack_slice()
 
     def apply_morphology(self, grow: bool) -> None:
         """Dilate (grow) or erode (shrink) the overlay mask by one pixel step."""
@@ -592,6 +609,7 @@ class QcGui(tk.Tk):
         self.update_status()
         self.schedule_mask_save()
         self.schedule_csv_save()
+        self._update_stack_slice()
 
     def erode_mask(self) -> None:
         self.apply_morphology(grow=False)
@@ -605,6 +623,7 @@ class QcGui(tk.Tk):
         self.records.at[self.index, "rotation"] = self.rotation
         self.render_all()
         self.schedule_csv_save()
+        self._update_stack_slice()
 
     def flip_h(self) -> None:
         lr_flip, up_flip = decode_flip(self.flip)
@@ -612,6 +631,7 @@ class QcGui(tk.Tk):
         self.records.at[self.index, "flip"] = self.flip
         self.render_all()
         self.schedule_csv_save()
+        self._update_stack_slice()
 
     def flip_v(self) -> None:
         lr_flip, up_flip = decode_flip(self.flip)
@@ -619,6 +639,7 @@ class QcGui(tk.Tk):
         self.records.at[self.index, "flip"] = self.flip
         self.render_all()
         self.schedule_csv_save()
+        self._update_stack_slice()
 
     # --- brush / mode ------------------------------------------------------- #
     def change_brush(self, delta: int) -> None:
@@ -667,6 +688,93 @@ class QcGui(tk.Tk):
     def on_wheel(self, event: tk.Event) -> None:
         self.change_brush(2 if event.delta > 0 else -2)
 
+    # --- slab stack viewer -------------------------------------------------- #
+    def _load_master(self) -> pd.DataFrame | None:
+        path = self.root_dir / "csv" / "master.csv"
+        if not path.exists():
+            return None
+        try:
+            return pd.read_csv(path, keep_default_na=False)
+        except Exception:
+            return None
+
+    def _ensure_stack(self) -> StackView | None:
+        if self.master_df is None:
+            return None
+        if self.stack is None or not self.stack.winfo_exists():
+            self.stack = StackView(
+                self, self.root_dir, self.master_df, self.splits_dir, self.mask_out_dir,
+                seek_callback=self.seek_from_stack,
+            )
+        return self.stack
+
+    def toggle_stack(self) -> None:
+        stack = self._ensure_stack()
+        if stack is None:
+            return
+        if stack.visible:
+            stack.hide()
+        else:
+            stack.show_adjacent(self)
+            self._sync_stack()
+
+    def _auto_open_stack(self) -> None:
+        stack = self._ensure_stack()
+        if stack is None:
+            return
+        stack.show_adjacent(self)
+        self._sync_stack()
+
+    def _zoom_stack(self, direction: int) -> None:
+        if self.stack is not None and self.stack.winfo_exists() and self.stack.visible:
+            self.stack.zoom_all(direction)
+
+    def current_slab_key(self) -> tuple | None:
+        try:
+            row = self.records.iloc[self.index]
+            return (str(row["sub"]), str(row["hemisphere"]), str(row["chunk"]))
+        except Exception:
+            return None
+
+    def _sync_stack(self) -> None:
+        if self.stack is None or not self.stack.winfo_exists() or not self.stack.visible:
+            return
+        slab = self.current_slab_key()
+        if slab is None:
+            return
+        self.stack.show_slab(slab)
+        self.stack.set_current(str(self.records.at[self.index, "base"]))
+        self._update_stack_slice()
+
+    def _update_stack_slice(self) -> None:
+        if self.stack is None or not self.stack.winfo_exists() or not self.stack.visible:
+            return
+        if self.base_img is None:
+            return
+        base = str(self.records.at[self.index, "base"])
+        if base not in self.stack.base_to_z:
+            return
+        mask_np = np.asarray(self.base_mask_img) if self.base_mask_img is not None else None
+        thumb = make_thumb(self.base_img, mask_np, self.flip, self.rotation)
+        self.stack.update_slice(base, thumb)
+
+    def seek_from_stack(self, base: str) -> None:
+        if self._stack_syncing:
+            return
+        matches = self.records.index[self.records["base"].astype(str) == str(base)]
+        if len(matches) == 0:
+            return
+        target = int(matches[0])
+        if target == self.index:
+            return
+        self._stack_syncing = True
+        try:
+            self.flush_mask()
+            self.index = target
+            self.load_current()
+        finally:
+            self._stack_syncing = False
+
     # --- navigation / keys -------------------------------------------------- #
     def move(self, delta: int) -> None:
         self.flush_mask()
@@ -710,6 +818,12 @@ class QcGui(tk.Tk):
             self.change_brush(-2)
         elif char == "]":
             self.change_brush(2)
+        elif char == "k":
+            self.toggle_stack()
+        elif char in ("+", "="):
+            self._zoom_stack(1)
+        elif char == "-":
+            self._zoom_stack(-1)
         elif key == "Escape" or char == "q":
             self.on_close()
 
@@ -778,6 +892,8 @@ class QcGui(tk.Tk):
 
     def on_close(self) -> None:
         self.commit_current()
+        if self.stack is not None and self.stack.winfo_exists():
+            self.stack.hide()
         self.destroy()
 
     # --- reviewed state ----------------------------------------------------- #
