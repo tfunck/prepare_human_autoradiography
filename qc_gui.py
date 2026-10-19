@@ -297,13 +297,6 @@ class QcGui(tk.Tk):
 
         ttk.Button(toolbar, text="Save", command=self.save_now).pack(side="left")
 
-        self.reviewed_button = ttk.Button(toolbar, text="Mark reviewed", command=self.toggle_reviewed)
-        self.reviewed_button.pack(side="left", padx=(10, 4))
-        self.reviewed_label = tk.Label(
-            toolbar, textvariable=self.reviewed_var, font=("TkDefaultFont", 10, "bold")
-        )
-        self.reviewed_label.pack(side="left")
-
         ttk.Label(toolbar, textvariable=self.status_var).pack(side="right")
 
         controls = ttk.Frame(self, padding=(8, 2))
@@ -328,6 +321,14 @@ class QcGui(tk.Tk):
         self.max_scale.pack(side="left", padx=(0, 8))
         ttk.Button(controls, text="Auto", command=self.auto_contrast).pack(side="left", padx=(4, 4))
         ttk.Button(controls, text="Reset", command=self.reset_contrast).pack(side="left")
+
+        self.reviewed_label = tk.Label(
+            controls, textvariable=self.reviewed_var, font=("TkDefaultFont", 10, "bold")
+        )
+        self.reviewed_label.pack(side="right", padx=(4, 0))
+        self.reviewed_button = ttk.Button(controls, text="Mark reviewed", command=self.toggle_reviewed)
+        self.reviewed_button.pack(side="right", padx=(10, 4))
+
         self.alpha_scale.set(self.overlay_alpha)
         self.min_scale.set(self.contrast_min)
         self.max_scale.set(self.contrast_max)
