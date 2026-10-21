@@ -160,17 +160,19 @@ class QcGui(tk.Tk):
         root_override: str | None = None,
         out_csv_override: str | None = None,
         mask_dir_override: str | None = None,
+        output_dir: str | None = None,
     ) -> None:
         super().__init__()
         self.title("Autoradiograph QC GUI")
         self.withdraw()  # stay hidden until we know we have a valid CSV to show
         self.aborted = False
 
-        resolved = self.resolve_inputs(csv_path, root_override, out_csv_override, mask_dir_override)
+        resolved = self.resolve_inputs(csv_path, root_override, out_csv_override, mask_dir_override, output_dir)
         if resolved is None:
             self.aborted = True
             return
         self.root_dir, self.records, self.out_csv, self.mask_out_dir = resolved
+        self.out_csv.parent.mkdir(parents=True, exist_ok=True)
         self.mask_out_dir.mkdir(parents=True, exist_ok=True)
 
         self.master_df = self._load_master()
@@ -239,6 +241,7 @@ class QcGui(tk.Tk):
         root_override: str | None,
         out_csv_override: str | None,
         mask_dir_override: str | None,
+        output_dir: str | None = None,
     ) -> tuple[Path, pd.DataFrame, Path, Path] | None:
         """Pick a CSV (file dialog if needed) and resolve all paths/records.
 
@@ -259,8 +262,19 @@ class QcGui(tk.Tk):
             return None
         root_dir = find_root(csv_path, root_override)
         self.split_csv_path = csv_path
-        out_csv = Path(out_csv_override).expanduser().resolve() if out_csv_override else csv_path.with_suffix(".qc.csv")
-        mask_out_dir = Path(mask_dir_override).expanduser().resolve() if mask_dir_override else root_dir / "mask_qc"
+        out_base = Path(output_dir).expanduser().resolve() if output_dir else None
+        if out_csv_override:
+            out_csv = Path(out_csv_override).expanduser().resolve()
+        elif out_base is not None:
+            out_csv = out_base / f"{csv_path.stem}.qc.csv"
+        else:
+            out_csv = csv_path.with_suffix(".qc.csv")
+        if mask_dir_override:
+            mask_out_dir = Path(mask_dir_override).expanduser().resolve()
+        elif out_base is not None:
+            mask_out_dir = out_base / "mask_qc"
+        else:
+            mask_out_dir = root_dir / "mask_qc"
         try:
             records = prepare_records(csv_path, out_csv)
         except Exception as exc:  # malformed/unreadable CSV -- report instead of crashing
@@ -949,15 +963,20 @@ def parse_args() -> argparse.Namespace:
         help="split CSV to review, e.g. csv/splits/MR1_L_afdx.csv (if omitted, a file picker opens)",
     )
     parser.add_argument("--root", default=None, help="directory holding raw/ and mask/ (auto-detected by default)")
-    parser.add_argument("--out-csv", default=None, help="output CSV for recorded flips/rotations (default <csv>.qc.csv)")
-    parser.add_argument("--mask-out-dir", default=None, help="directory for edited masks (default <root>/mask_qc)")
+    parser.add_argument(
+        "-o", "--output-dir", default=None,
+        help="base directory for all outputs: writes <output-dir>/<csv>.qc.csv and edited masks to "
+             "<output-dir>/mask_qc (the more specific --out-csv/--mask-out-dir take precedence)",
+    )
+    parser.add_argument("--out-csv", default=None, help="output CSV for recorded flips/rotations (default <csv>.qc.csv, or <output-dir>/<csv>.qc.csv)")
+    parser.add_argument("--mask-out-dir", default=None, help="directory for edited masks (default <root>/mask_qc, or <output-dir>/mask_qc)")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     csv_path = Path(args.csv).expanduser().resolve() if args.csv else None
-    app = QcGui(csv_path, args.root, args.out_csv, args.mask_out_dir)
+    app = QcGui(csv_path, args.root, args.out_csv, args.mask_out_dir, args.output_dir)
     if app.aborted:
         app.destroy()
         return
