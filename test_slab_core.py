@@ -62,6 +62,20 @@ def test_mri_ants_geometry_matches_ants_reader(slab):
     assert np.allclose(ants.transform_index_to_physical_point(img, ijk), mri.voxel_to_lps(ijk)[0], atol=1e-4)
 
 
+def test_ants_crop_matches_cropping_the_full_image(slab, tmp_path):
+    """The floating window crops from numpy (no full-size ANTs copy); same image as before."""
+    _df, _c, st, mri, g, _t = load(slab)
+    res = sc.fit_transform(sc.landmark_pairs(st, g, mri), g, mri, sc.TransformSettings(), tmp_path)
+    assert res.mri_bbox is not None
+    old, new = sc.crop(mri.ants_image(), res.mri_bbox), mri.ants_crop(res.mri_bbox)
+    assert new.shape == old.shape
+    assert np.allclose(new.origin, old.origin, atol=1e-4) and np.allclose(new.direction, old.direction)
+    assert np.allclose(new.numpy(), old.numpy())
+    ref = g.coronal_ref(float(g.y[g.n // 2]), res.mirror)
+    assert np.allclose(sc.resample_plane(res, new, ref), sc.resample_plane(res, old, ref), atol=1e-4)
+    assert mri.ants_crop(None).shape == mri.shape
+
+
 def test_pairs_and_other_slabs(slab):
     df, cols, st, mri, g, truth = load(slab)
     conflicts = sc.other_slab_labels(df, cols, slab, KEY)

@@ -8,9 +8,11 @@ shifted so the centres of mass of their masks (CSV "mask" column) line up; see
 --order and --center (a CSV whose sections each have their own number is
 stacked at section number x slice thickness instead).
 
-A floating window shows the MRI resampled into slab space with
-antsApplyTransforms, using a transform fitted to the landmark pairs: none
-(< 3 pairs), rigid, affine, or affine + B-spline.
+On request (Compute transform, Ctrl+T) a transform is fitted to the landmark
+pairs: none (< 3 pairs), rigid, affine, or affine + B-spline. Nothing is fitted
+automatically; after landmarks change the last transform is marked out of date.
+An optional floating window (Ctrl+M, hidden at start) shows the MRI resampled
+into slab space with antsApplyTransforms using that transform.
 
     python slab_gui.py --csv sections.csv --mri donor_T1.nii.gz \
         --mri-labels mri_landmarks.nii.gz --sub MR1 --hemisphere L --chunk 6 \
@@ -29,6 +31,7 @@ Keys
   P / N (Esc)   Paint / Navigate      Left/Right, Up/Down   previous/next slice (pane under the mouse)
   [ and ]       brush size            F                     fit the views under the mouse
   Ctrl+G        go to label           Ctrl+Z  undo          Ctrl+S  save
+  Ctrl+T        compute the transform from the current landmarks
   Ctrl+M        show/hide the floating "MRI in slab space" window (also View menu)
 
 Nothing is written unless an annotation changes. Edited labels and a new CSV go
@@ -675,7 +678,8 @@ class SlabPane(OrthoPane):
         if idx == self.idx and not force and self.cur is not None:
             return
         self.clear_goto()
-        self.main.warp.pane.clear_goto()
+        if self.main.warp is not None:
+            self.main.warp.pane.clear_goto()
         self.idx = idx
         self.thumbs.prioritise(idx)
         self.sec_slider.blockSignals(True)
@@ -695,7 +699,8 @@ class SlabPane(OrthoPane):
         if x is not None or z is not None:
             self.views["sagittal"].set_goto()
             self.views["axial"].set_goto()
-            self.main.warp.pane.clear_goto()
+            if self.main.warp is not None:
+                self.main.warp.pane.clear_goto()
         if x is not None:
             self.x = float(np.clip(x, 0, g.extent[0]))
         if z is not None:
@@ -961,7 +966,16 @@ class WarpWindow(QtWidgets.QWidget):
         self.labels_cb.setChecked(True)
         self.labels_cb.toggled.connect(lambda _v: self.pane.render_all())
         row.addWidget(self.labels_cb)
+        compute = _tool("Compute transform", "Fit the transform to the current landmarks (Ctrl+T)")
+        compute.clicked.connect(main.compute_fit)
+        row.addWidget(compute)
         lay.addLayout(row)
+
+    def release(self):
+        """Drop the resampled planes (called when the window is hidden)."""
+        self.pane.planes.clear()
+        for v in self.pane.views.values():
+            v.clear()
 
     def place(self):
         """Put the window over the lower-right part of the main window, on screen."""
@@ -1129,6 +1143,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._saved_top = None
         self.dirty = False
         self.fit: sc.FitResult | None = None
+        self.fit_stale = False             # landmarks/settings changed since self.fit was computed
+        self._landmark_gen = 0             # bumped on every landmark/settings change
         self.pairs: sc.Pairs | None = None
         self.workdir = sc.new_workdir()
         self.show_numbers = bool(state.get("show_numbers", True))
@@ -1153,17 +1169,13 @@ class MainWindow(QtWidgets.QMainWindow):
         split.addWidget(self.mri_pane)
         split.setSizes([900, 700])
         self.setCentralWidget(split)
-        self.warp = WarpWindow(self)
+        self.warp: WarpWindow | None = None    # created the first time it is shown (Ctrl+M)
         self._build_dock(state)
         self._build_menu()
         self._build_shortcuts()
         self.hover_lbl = QtWidgets.QLabel()
         self.statusBar().addPermanentWidget(self.hover_lbl)
 
-        self._fit_timer = QtCore.QTimer(self)
-        self._fit_timer.setSingleShot(True)
-        self._fit_timer.setInterval(300)
-        self._fit_timer.timeout.connect(self.run_fit)
         self._warp_timer = QtCore.QTimer(self)
         self._warp_timer.setSingleShot(True)
         self._warp_timer.setInterval(120)
@@ -1205,18 +1217,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._autosave.setInterval(int(autosave_min * 60_000))
             self._autosave.timeout.connect(self._on_autosave)
             self._autosave.start()
-        self.schedule_fit(now=True)
-        # The floating window is shown once the main window is on screen (showEvent);
-        # shown earlier, the main window would open on top of it and hide it.
-        self._warp_on_start = bool(state.get("warp_visible", True))
-        self._shown_once = False
-
-    def showEvent(self, ev):
-        super().showEvent(ev)
-        if not self._shown_once:
-            self._shown_once = True
-            if self._warp_on_start:
-                QtCore.QTimer.singleShot(0, lambda: self.warp_action.setChecked(True))
+        # No transform is fitted and the floating window stays closed until asked for
+        # (Compute transform / Ctrl+T, MRI in slab space / Ctrl+M): resampling a large
+        # MRI costs a lot of memory.
+        self._update_fit_status()
 
     # -- UI ----------------------------------------------------------------------- #
     def _update_title(self):
@@ -1310,9 +1314,15 @@ class MainWindow(QtWidgets.QMainWindow):
             b.clicked.connect(slot)
             tb2.addWidget(b)
         tb2.addSeparator()
+        self.fit_action = LG.QAction("Compute transform", self)
+        self.fit_action.setToolTip("Fit the slab → MRI transform to the current landmark pairs (Ctrl+T)")
+        self.fit_action.setShortcut(QtGui.QKeySequence("Ctrl+T"))
+        self.fit_action.triggered.connect(self.compute_fit)
+        tb2.addAction(self.fit_action)
         self.warp_action = LG.QAction("MRI in slab space", self)
         self.warp_action.setCheckable(True)
-        self.warp_action.setToolTip("Show/hide the floating window with the MRI resampled into slab space (Ctrl+M)")
+        self.warp_action.setToolTip("Show/hide the floating window with the MRI resampled into slab space (Ctrl+M). "
+                                    "Uses the last computed transform; resampling a large MRI needs extra memory.")
         self.warp_action.setShortcut(QtGui.QKeySequence("Ctrl+M"))
         self.warp_action.toggled.connect(self._toggle_warp)
         tb2.addAction(self.warp_action)
@@ -1373,6 +1383,10 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Control-point spacing", self.cp_spacing)
         form.addRow("B-spline levels (max)", self.levels)
         form.addRow("Slab handedness", self.hand)
+        btn = QtWidgets.QPushButton("Compute transform")
+        btn.setToolTip("Fit the transform to the current landmark pairs (Ctrl+T)")
+        btn.clicked.connect(self.compute_fit)
+        form.addRow(btn)
         self.fit_status = QtWidgets.QLabel("…")
         self.fit_status.setWordWrap(True)
         form.addRow(self.fit_status)
@@ -1393,8 +1407,10 @@ class MainWindow(QtWidgets.QMainWindow):
         v = self.menuBar().addMenu("&View")
         v.addAction(self.warp_action)
         a = LG.QAction("Bring the MRI-in-slab-space window to the front", self)
-        a.triggered.connect(lambda: (self.warp_action.setChecked(True), self.warp.bring_up()))
+        a.triggered.connect(self._bring_up_warp)
         v.addAction(a)
+        v.addSeparator()
+        v.addAction(self.fit_action)
         h = self.menuBar().addMenu("&Help")
         a = LG.QAction("Mouse and keys", self)
         text = "Mouse" + __doc__.split("Mouse", 1)[1].split("Nothing is written")[0]
@@ -1451,21 +1467,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_numbers = bool(on)
         self.slab.update_annotations()
         self.mri_pane.update_annotations()
-        self.warp.pane.render_all()
+        if self.warp_visible():
+            self.warp.pane.render_all()
+
+    def warp_visible(self) -> bool:
+        return self.warp is not None and self.warp.isVisible()
+
+    def _bring_up_warp(self):
+        if self.warp_action.isChecked():
+            self.warp.bring_up()
+        else:
+            self.warp_action.setChecked(True)
 
     def _toggle_warp(self, on):
         if on:
+            if self.warp is None:
+                self.warp = WarpWindow(self)
+            self._update_fit_status()
             self.warp.bring_up()
             self.request_warp()
-        else:
+        elif self.warp is not None:
             self.warp.hide()
+            self._release_warp_memory()
+
+    def _release_warp_memory(self):
+        """Free everything the floating window holds while it is hidden."""
+        self._warp_timer.stop()
+        if self.warp is not None:
+            self.warp.release()
+        if self.fit is not None:
+            self.fit._img_crop = None
+        self._lab_crop_cache = None
+        self.mri._ants_img = self.mri._ants_lab = None
 
     def _thumb_tick(self):
         done, n = self.thumbs.progress
         if not hasattr(self, "_thumb_done") or self._thumb_done != done:
             self._thumb_done = done
             self.slab.render_thumb_views()
-            if self.warp.isVisible():
+            if self.warp_visible():
                 self.warp.pane.render_overlays(("sagittal", "axial"))
         if done >= n:
             self._thumb_timer.stop()
@@ -1480,7 +1520,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_overlays(self):
         self.slab.views["coronal"].set_labels(self.slab.section_labels_uv(self.slab.idx))
         self.mri_pane.render()
-        self.warp.pane.render_all()
+        if self.warp_visible():
+            self.warp.pane.render_all()
 
     def used_labels(self):
         return set(self.mri.stats) | self.stack.all_labels() | set(self.conflicts)
@@ -1491,7 +1532,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.flash(f"Current label set to {self.label_spin.value()} (unused in this slab, other slabs and the MRI)")
 
     def on_slab_cursor(self):
-        if self.warp.isVisible():
+        if self.warp_visible():
             self.warp.pane.update_annotations()
             self._warp_timer.start()
 
@@ -1575,7 +1616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if (sc.MRI_KEY,) in by_key:
             self.mri_pane.render()
         self._table_timer.start()
-        self.schedule_fit()
+        self.mark_fit_stale()
 
     def undo(self):
         if self._stroke is not None:
@@ -1635,37 +1676,57 @@ class MainWindow(QtWidgets.QMainWindow):
         s = self.settings
         s.rigid_min, s.affine_min, s.nonlinear_min = self.rigid_min.value(), self.affine_min.value(), self.nl_min.value()
         s.cp_spacing, s.levels, s.handedness = self.cp_spacing.value(), self.levels.value(), self.hand.currentText()
-        self.schedule_fit()
+        self.mark_fit_stale()
 
-    def schedule_fit(self, now=False):
-        self.fit_status.setText("fitting…")
-        if now:
-            self.run_fit()
+    def mark_fit_stale(self):
+        """Landmarks or settings changed: keep the last transform but flag it (no refit)."""
+        self._landmark_gen += 1
+        if self.fit is not None and not self.fit_stale:
+            self.fit_stale = True
+            self._update_fit_status()
+            self._table_timer.start()
+
+    def _update_fit_status(self, extra=""):
+        if self.async_.busy("fit"):
+            txt = "fitting…"
+        elif self.fit is None:
+            txt = "No transform computed yet. Press <b>Compute transform</b> (Ctrl+T)."
         else:
-            self._fit_timer.start()
+            txt = self.fit.summary()
+            if self.fit_stale:
+                txt = ("<span style='color:#e0a030'>Out of date: the landmarks or settings changed since this "
+                       "transform was computed. Press <b>Compute transform</b> (Ctrl+T) to update it.</span><br>"
+                       + txt)
+        self.fit_status.setText(txt + extra)
+        if self.warp is not None:
+            self.warp.status.setText(txt)
 
-    def run_fit(self):
+    def compute_fit(self):
+        """Fit the transform to the current landmark pairs (only ever on request)."""
         self.pairs = sc.landmark_pairs(self.stack, self.geom, self.mri, self.conflicts)
         pairs, geom, mri = self.pairs, self.geom, self.mri
         settings = sc.TransformSettings(**vars(self.settings))
-        self.async_.submit("fit", lambda: sc.fit_transform(pairs, geom, mri, settings, self.workdir), self._on_fit)
+        gen = self._landmark_gen
+        self.async_.submit("fit", lambda: sc.fit_transform(pairs, geom, mri, settings, self.workdir),
+                           lambda res, exc: self._on_fit(res, exc, gen))
+        self._update_fit_status()
 
-    def _on_fit(self, res, exc):
+    def _on_fit(self, res, exc, gen):
         if exc is not None:
-            self.fit = None
-            self.fit_status.setText(f"<span style='color:#d9534f'>Fit failed: {exc}</span>")
+            self._update_fit_status(f"<br><span style='color:#d9534f'>Fit failed: {exc}</span>")
             return
+        if self.fit is not None:
+            self.fit._img_crop = None                    # free the old transform's MRI crop now
         self.fit = res
+        self.fit_stale = gen != self._landmark_gen      # edited while the fit was running
         if res.ok and self.settings.handedness == "auto" and not res.handedness_note:
             self.settings.last_mirror = res.mirror
-        excl = ""
-        if self.pairs and self.pairs.excluded:
-            excl = "<br>Not used: " + ", ".join(f"{k} ({v})" for k, v in sorted(self.pairs.excluded.items()))
-        txt = res.summary()
+        extra = ""
         if res.ok:
-            txt += f"<br>fit {res.seconds:.2f} s; transforms: " + " ← ".join(Path(f).name for f in res.files)
-        self.fit_status.setText(txt + excl)
-        self.warp.status.setText(txt)
+            extra += f"<br>fit {res.seconds:.2f} s; transforms: " + " ← ".join(Path(f).name for f in res.files)
+        if self.pairs and self.pairs.excluded:
+            extra += "<br>Not used: " + ", ".join(f"{k} ({v})" for k, v in sorted(self.pairs.excluded.items()))
+        self._update_fit_status(extra)
         self._table_timer.start()
         self._lab_crop_cache = None
         self.request_warp()
@@ -1684,13 +1745,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return out
 
     def request_warp(self):
-        if not self.warp.isVisible():
+        if not self.warp_visible():
             return
         fit = self.fit
         if fit is None or not fit.ok:
             for v in self.warp.pane.views.values():
                 v.clear()
-                v.note(fit.message if fit is not None else "no transform yet", "muted")
+                v.note(fit.message if fit is not None else "no transform yet · press Compute transform (Ctrl+T)",
+                       "muted")
             return
         for v in self.warp.pane.views.values():
             v.note("")
@@ -1706,15 +1768,14 @@ class MainWindow(QtWidgets.QMainWindow):
             ants = sc._ants()
             cache = getattr(fit, "_img_crop", None)
             if cache is None:
-                cache = sc.crop(mri.ants_image(), bbox)
+                # Only the part of the MRI the slab maps to: never a second full-size copy.
+                cache = mri.ants_crop(bbox)
                 fit._img_crop = cache
             lab_img = None
             if want_labels:
                 if lab_crop is not None:
                     arr, o, sp, d = lab_crop
                     lab_img = ants.from_numpy(arr, origin=o, spacing=sp, direction=d)
-                else:
-                    lab_img = mri.ants_labels()
             out = {}
             for name, ref in refs.items():
                 img = sc.resample_plane(fit, cache, ref, "linear")
@@ -1724,6 +1785,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return out
 
         def done(out, exc):
+            if not self.warp_visible():
+                return
             if exc is not None:
                 self.warp.status.setText(f"<span style='color:#d9534f'>Resampling failed: {exc}</span>")
                 return
@@ -1745,7 +1808,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.go_to_label(lab)
 
     def _clear_goto(self):
-        for pane in self.panes + [self.warp.pane]:
+        for pane in self.panes + ([self.warp.pane] if self.warp is not None else []):
             for v in pane.views.values():
                 v.set_goto()
 
@@ -1784,8 +1847,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if lo[1] - 1.0 <= p[1] <= hi[1] + 1.0:
                 idx = self.geom.nearest_section(p[1])
                 self._show_slab_point(p, idx, predicted=True)
-                cv.note(f"label {lab} not on this slab · predicted position from the {self.fit.kind} transform "
-                        f"(dashed)", "warn")
+                cv.note(f"label {lab} not on this slab · predicted position from the "
+                        f"{'out-of-date ' if self.fit_stale else ''}{self.fit.kind} transform (dashed)", "warn")
             else:
                 cv.note(f"label {lab} not on this slab · predicted y = {p[1]:.1f} mm is outside the slab "
                         f"({lo[1]:.1f}–{hi[1]:.1f} mm)", "muted")
@@ -1804,6 +1867,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row = g.y_to_row(p[1])
         s.views["sagittal"].set_goto(row, p[2] / g.ts - 0.5, predicted)
         s.views["axial"].set_goto(p[0] / g.ts - 0.5, row, predicted)
+        if self.warp is None:
+            return
         w = self.warp.pane.views
         w["coronal"].set_goto(p[0] / g.cs - 0.5, p[2] / g.cs - 0.5, predicted)
         w["sagittal"].set_goto(row, p[2] / g.ts - 0.5, predicted)
@@ -1823,7 +1888,8 @@ class MainWindow(QtWidgets.QMainWindow):
         labels = sorted(set(self.mri.stats) | set(locs) | set(self.conflicts))
         res = self.fit.residuals if (self.fit is not None and self.fit.ok) else {}
         excluded = self.pairs.excluded if self.pairs else {}
-        headers = ["Label", "MRI", "This slab", "Other slab", "Fit error"]
+        headers = ["Label", "MRI", "This slab", "Other slab",
+                   "Fit error (out of date)" if (res and self.fit_stale) else "Fit error"]
         t = self.table
         t.setUpdatesEnabled(False)
         t.clear()
@@ -1889,7 +1955,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.go_to_label(int(it.data(Qt.ItemDataRole.UserRole)))
 
     def validate_now(self):
-        self.populate_issues(sc.validate_slab(self.stack, self.mri, self.conflicts, self.fit, self.geom))
+        fit = self.fit if not self.fit_stale else None
+        self.populate_issues(sc.validate_slab(self.stack, self.mri, self.conflicts, fit, self.geom))
 
     def populate_issues(self, issues, switch=True):
         self.issues = list(self._load_warnings) + list(issues)
@@ -1934,7 +2001,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return dict(slab=self.slab.state(), mri=self.mri_pane.state(), current_label=int(self.label_spin.value()),
                     brush_slab=self.brush_slab.value(), brush_mri=self.brush_mri.value(),
                     overlay_alpha=self.alpha, show_numbers=self.show_numbers, protect=self.protect_cb.isChecked(),
-                    transform=vars(self.settings), warp_visible=self.warp.isVisible())
+                    transform=vars(self.settings), warp_visible=self.warp_visible())
 
     def _ensure_writable(self, interactive):
         while not self._out_owned:
@@ -1988,7 +2055,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             names = self.names()
-            fit = self.fit
+            fit = self.fit if not self.fit_stale else None     # only a transform matching these landmarks
             rep = core.save_session(
                 names, self.ds["df"], self.ds["columns"], [self.stack], self.mri, self.label_format,
                 input_csv_dir=Path(self.ds["csv_path"]).parent, session_info=self.session_info,
@@ -2034,13 +2101,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 core.write_text_atomic(self.names().aux(core.STATE_JSON), json.dumps(self.gui_state(), indent=2))
             except OSError:
                 pass
-        for t in (self._fit_timer, self._warp_timer, self._table_timer, self._thumb_timer, self._autosave):
+        for t in (self._warp_timer, self._table_timer, self._thumb_timer, self._autosave):
             t.stop()
         self.thumbs.stop()
         self.async_.closed = True
         self.stack._pool.shutdown(wait=False, cancel_futures=True)
         self.async_.pool.shutdown(wait=True, cancel_futures=True)
-        self.warp.close()
+        if self.warp is not None:
+            self.warp.close()
         self.release_ants()
         ev.accept()
 

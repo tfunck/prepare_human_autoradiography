@@ -7,7 +7,7 @@ alignment from them:
 - **`landmark_gui.py`** — several hemisphere stacks against a 3-D template
   (macaque). Described in the first part of this README.
 - **`slab_gui.py`** — one human autoradiography slab against the donor MRI,
-  with a live landmark transform. See [Slab tool](#slab-tool-human-slabs--donor-mri).
+  with a landmark transform computed on request. See [Slab tool](#slab-tool-human-slabs--donor-mri).
 
 Each hemisphere stack gets its own pane, and one pane shows the coronal slices
 of the template with its existing 3-D landmarks. Label values are shared
@@ -329,9 +329,12 @@ sections of 11539-R, and a label 99 in 11543-L with no template counterpart.
 # Slab tool (human slabs → donor MRI)
 
 `slab_gui.py` shows one slab of coronal autoradiograph sections next to the
-donor MRI, each in coronal, sagittal and axial views. A floating window shows
-the MRI resampled into slab space with `antsApplyTransforms`. The transform is
-fitted to the landmark pairs and updates as you edit.
+donor MRI, each in coronal, sagittal and axial views. **Compute transform**
+(Ctrl+T, toolbar, Transform tab) fits a transform to the landmark pairs. It is
+never fitted automatically: after you edit landmarks or settings the last one
+is kept but marked *out of date* until you compute it again. An optional
+floating window (Ctrl+M, closed at start) shows the MRI resampled into slab
+space with `antsApplyTransforms`, using the last computed transform.
 
 ![slab layout](docs/slab_layout.png)
 
@@ -449,7 +452,8 @@ images as stored and uses the `mask` column.
 | ←/→, ↑/↓ | previous/next section (or MRI coronal slice, pane under the mouse) |
 | box next to the section slider | go to a section: its number, or in a stacked slab its position (1…n, as shown above the views) or part of its name, e.g. `dpmg#6555#01` |
 | `[` `]`, F, Ctrl+G, Ctrl+Z, Ctrl+S | brush size, fit views, go to label, undo, save |
-| Ctrl+M (or View menu, or the "MRI in slab space" toolbar button) | show/hide the floating window; it opens over the lower-right of the main window and stays in front of it |
+| Ctrl+T (or the "Compute transform" button in the toolbar, Transform tab or floating window) | fit the transform to the current landmarks |
+| Ctrl+M (or View menu, or the "MRI in slab space" toolbar button) | show/hide the floating window; closed at start, it opens over the lower-right of the main window and stays in front of it. Closing it frees the memory used for resampling. |
 
 Clicking the slab's sagittal/axial views or the floating window always moves
 the cursor.
@@ -543,7 +547,7 @@ flagged in the Issues tab.
 | `../landmark_sections_<tag>.csv` | in the project folder next to the output folder: the input CSV (all slabs) with this slab's label paths updated; paths relative to the project folder |
 | `<mri labels stem>_<tag>.nii.gz` | all MRI landmarks (e.g. `mri_landmarks_v1.1.nii.gz`) |
 | `sub-<sub>_hemi-<h>_chunk-<c>_landmarks_<tag>.nii.gz` | MRI landmarks of **this slab only**, one-to-one with its 2-D labels (BrainBuilder's per-chunk `ref_landmark`). Written only when the slab has no validation errors. |
-| `landmark_fit.csv` | each pair: section number, position in the stack, name, slab mm, MRI RAS mm, fit error, transform type; excluded labels with the reason |
+| `landmark_fit.csv` | each pair: section number, position in the stack, name, slab mm, MRI RAS mm, fit error, transform type; excluded labels with the reason. Fit errors are written only if the transform was computed after the last edit (otherwise transform type `none`). |
 | `landmark_table.csv`, `landmark_coverage.csv`, `validation_report.txt`, `session.json`, `gui_state.json` | as above |
 
 ## Try it
@@ -573,4 +577,6 @@ Measured on 3120×4164-pixel sections (0.02 mm):
 - each labelled section holds a 16-bit label image (26 MB at that size).
 
 Fitting takes milliseconds. Resampling one plane through the transform takes
-about 0.05 s.
+about 0.05 s. The floating window resamples from a copy of only the MRI region
+the slab maps to; a 0.25 mm donor MRI (724×868×724) already takes ≈ 1.8 GB as
+float32, so keep the window closed on machines short of memory.

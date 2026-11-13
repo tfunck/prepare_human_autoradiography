@@ -705,6 +705,21 @@ class DonorMRI(core.Template):
             self._ants_img = _ants().from_numpy(self.image, origin=o, spacing=s, direction=d)
         return self._ants_img
 
+    def ants_crop(self, bbox, labels: bool = False):
+        """ANTs image of the voxels inside ``bbox`` ((lo, hi) voxel indices, inclusive;
+        None = the whole volume), built from a copy of just that block. Unlike
+        ants_image()/ants_labels() this never holds a second full-size copy of a
+        large MRI, and nothing is cached."""
+        vol = self.labels if labels else self.image
+        if bbox is None:
+            lo, hi = (0, 0, 0), tuple(s - 1 for s in self.shape)
+        else:
+            lo, hi = bbox
+        arr = np.ascontiguousarray(vol[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1], dtype=np.float32)
+        _o, spacing, direction = self.ants_geometry()
+        origin = tuple(float(v) for v in self.voxel_to_lps(lo)[0])
+        return _ants().from_numpy(arr, origin=origin, spacing=spacing, direction=direction)
+
     def ants_labels(self):
         if self._ants_lab is None or self._lab_version != self.version:
             o, s, d = self.ants_geometry()
